@@ -1,0 +1,63 @@
+import ee
+import os
+import json
+import geemap
+from config import *
+import numpy as np
+
+ee.Initialize()
+
+def load_hansen_forest_mask(roi):
+    # load treecover2000 >= 50 and loss year from 2001–2024
+    hansen = ee.Image(HANSEN_ASSET)
+    base_forest = hansen.select("treecover2000").gte(50)
+    loss_mask = hansen.select("loss").selfMask()  # 1 where loss happened
+    loss_year = hansen.select("lossyear")
+    return base_forest, loss_year
+
+def sentinel_cloud_mask(img):
+    # simple cloud mask using SCL (Scene Classification)
+    scl = img.select("SCL")
+    mask = scl.neq(3).And(scl.neq(9)).And(scl.neq(10))
+    return img.updateMask(mask)
+
+def composite_period(roi, start, end):
+    col = (
+        ee.ImageCollection("COPERNICUS/S2_SR")
+        .filterBounds(roi)
+        .filterDate(start, end)
+    )
+    col = col.map(sentinel_cloud_mask)
+    ndvi = lambda img: img.addBands(
+        img.normalizedDifference(["B08", "B04"]).rename("NDVI")
+    )
+    col = col.map(ndvi)
+    vis = col.select(NDVI_INPUT_BANDS)
+    return vis.median().clip(roi)
+
+def main():
+    os.makedirs(EXPORT_FOLDER, exist_ok=True)
+    with open(ROI_GEOJSON) as f:
+        region = ee.FeatureCollection(json.load(f))
+
+    before = composite_period(region, TIME_BEFORE, f"{int(TIME_BEFORE[:4])+1}")
+    after = composite_period(region, TIME_AFTER, f"{int(TIME_AFTER[:4])+1}")
+
+    base_forest, loss_year = load_hansen_forest_mask(region)
+    loss12 = loss_year.gte(int(TIME_BEFORE[:4])+1).And(loss_year.lte(int(TIME_AFTER[:4])+1))
+
+    task = ee.batch.Export.image.toDrive(
+        image=before.addBands(after).addBands(loss12.rename("deforested")).toFloat(),
+        description="export_ndvi_and_loss",
+        folder=EXPORT_FOLDER,
+        region=region.geometry(),
+        scale=10,
+        maxPixels=1e12,
+        fileFormat="TFRecord",
+        fileDimensions=f"{PATCH_SIZE_PX},{PATCH_SIZE_PX}"
+    )
+    task.start()
+    print("Export kicked off:", task.status())
+
+if __name__ == "__main__":
+    main()
